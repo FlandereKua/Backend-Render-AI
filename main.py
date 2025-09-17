@@ -4,12 +4,21 @@ import re
 import json
 import requests
 from datetime import datetime, timezone
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+import traceback
 from dotenv import load_dotenv
+from fastapi import Body
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
 
 # ---------------- Helpers (copied from google.py) ----------------
+
+router = APIRouter()
+
+class AskRequest(BaseModel):
+    question: str
 
 def remove_markdown(text):
     text = re.sub(r'\*{1,3}([^\*]+)\*{1,3}', r'\1', text)
@@ -108,19 +117,21 @@ app.add_middleware(
 def root():
     return {"status": "ok", "message": "Gemini FastAPI service running."}
 
-@app.post("/ask")
-def ask_question(payload: dict):
-    question = payload.get("question")
+@router.post("/ask")
+def ask_question(req: AskRequest):
+    question = req.question.strip()
     if not question:
-        raise HTTPException(status_code=400, detail="Missing 'question'")
+        raise HTTPException(status_code=400, detail="Empty 'question' field")
 
-    use_search = serper_api_key and needs_realtime_search(question)
+    use_search = SERPER_API_KEY and needs_realtime_search(question)
+
     try:
         if use_search:
-            web_results = search_with_serper(question, serper_api_key, "search")
+            web_results = search_with_serper(question, SERPER_API_KEY, "search")
             news_results = None
-            if any(k in question.lower() for k in ["news","latest","breaking","today"]):
-                news_results = search_with_serper(question, serper_api_key, "news")
+            if any(k in question.lower() for k in ["news", "latest", "breaking", "today"]):
+                news_results = search_with_serper(question, SERPER_API_KEY, "news")
+
             search_context = format_search_context(web_results, news_results)
             composed = (
                 "Based on the following real-time search results, "
@@ -133,6 +144,16 @@ def ask_question(payload: dict):
             response = chat.send_message(question)
 
         resp_text = getattr(response, "text", None) or "No response"
-        return {"answer": remove_markdown(resp_text), "used_search": bool(use_search)}
+        return {
+            "answer": remove_markdown(resp_text),
+            "used_search": bool(use_search)
+        }
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print("ERROR in /ask:", str(e))
+        print(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}"
+        )
+
