@@ -1,0 +1,12 @@
+
+# Ignore markdown notes
+Day1.md
+
+# Ignore environment variables
+.env
+
+# Ignore local virtual environment
+.venv/
+
+# Ignore old CLI script
+google.py
