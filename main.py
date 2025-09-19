@@ -6,15 +6,14 @@ import traceback
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import google.generativeai as genai
 
 # ---------------- Load environment ----------------
 load_dotenv()
-
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
-
 if not GOOGLE_API_KEY:
     raise RuntimeError("GOOGLE_API_KEY must be set in environment variables")
 
@@ -24,7 +23,6 @@ genai.configure(api_key=GOOGLE_API_KEY)
 SYSTEM_PROMPT = """You are a helpful, concise assistant.
 - Use provided real-time search context (if present) to answer up-to-date questions, and say when you used it.
 - Otherwise, use your general knowledge.
-- Be accurate and cite assumptions.
 """
 
 model = genai.GenerativeModel(
@@ -33,19 +31,15 @@ model = genai.GenerativeModel(
     generation_config={
         "temperature": 0.6,
         "top_p": 0.9,
-        "max_output_tokens": 1024,
+        "max_output_tokens": 4000,
     },
 )
 
-# Start chat session
-chat = model.start_chat(history=[])
-
 # ---------------- FastAPI setup ----------------
 app = FastAPI(title="Gemini FastAPI Webhook")
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # TODO: replace ["*"] with your frontend domain for security
+    allow_origins=["*"],   # 🔒 Replace with your frontend domain in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -65,6 +59,7 @@ def remove_markdown(text: str) -> str:
     return text.strip()
 
 def needs_realtime_search(prompt: str) -> bool:
+    """Heuristic to decide if real-time search is needed."""
     realtime_keywords = [
         "today","current","latest","recent","now","news","update","price",
         "weather","score","stock","crypto","bitcoin","election","breaking",
@@ -77,10 +72,10 @@ def needs_realtime_search(prompt: str) -> bool:
         r"what.*happening", r"who.*president", r"who.*prime minister",
         r"what.*price", r"how much.*cost", r"what.*weather"
     ]
-    import re
     return any(re.search(pattern, p) for pattern in current_patterns)
 
 def search_with_serper(query: str, api_key: str, search_type: str = "search"):
+    """Perform a Google Serper API search."""
     url = f"https://google.serper.dev/{search_type}"
     headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
     payload = {"q": query, "num": 5}
@@ -91,6 +86,7 @@ def search_with_serper(query: str, api_key: str, search_type: str = "search"):
     return r.json()
 
 def format_search_context(search_results: dict, news_results: dict | None = None) -> str:
+    """Format Serper results into context text for Gemini."""
     context = "REAL-TIME SEARCH RESULTS:\n\n"
     if search_results and "organic" in search_results:
         context += "WEB SEARCH RESULTS:\n"
@@ -107,49 +103,64 @@ def format_search_context(search_results: dict, news_results: dict | None = None
             context += f"   Summary: {article.get('snippet','No summary')}\n"
     return context
 
-# ---------------- Request/Response Models ----------------
+# ---------------- Models ----------------
 class AskRequest(BaseModel):
     question: str
 
-class AskResponse(BaseModel):
-    answer: str
-    used_search: bool
-
-# ---------------- API Endpoints ----------------
+# ---------------- Endpoints ----------------
 @app.get("/")
 def root():
     return {"status": "ok", "message": "Gemini FastAPI service running."}
 
-@app.post("/ask", response_model=AskResponse)
-def ask_question(req: AskRequest):
+@app.post("/ask_stream")
+async def ask_stream(req: AskRequest):
+    """
+    Stream Gemini response line-by-line over SSE.
+    Uses Serper when real-time search is needed.
+    """
     question = req.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="Empty 'question' field")
 
     use_search = SERPER_API_KEY and needs_realtime_search(question)
 
-    try:
-        if use_search:
-            web_results = search_with_serper(question, SERPER_API_KEY, "search")
-            news_results = None
-            if any(k in question.lower() for k in ["news", "latest", "breaking", "today"]):
-                news_results = search_with_serper(question, SERPER_API_KEY, "news")
+    def event_stream():
+        try:
+            if use_search:
+                web_results = search_with_serper(question, SERPER_API_KEY, "search")
+                news_results = None
+                if any(k in question.lower() for k in ["news", "latest", "breaking", "today"]):
+                    news_results = search_with_serper(question, SERPER_API_KEY, "news")
 
-            search_context = format_search_context(web_results, news_results)
-            composed = (
-                "Based on the following real-time search results, "
-                "answer the user's question. Indicate you used current search data.\n\n"
-                f"{search_context}\n\n"
-                f"USER QUESTION: {question}"
-            )
-            response = chat.send_message(composed)
-        else:
-            response = chat.send_message(question)
+                search_context = format_search_context(web_results, news_results)
+                composed = (
+                    "Based on the following real-time search results, "
+                    "answer the user's question. Indicate you used current search data.\n\n"
+                    f"{search_context}\n\n"
+                    f"USER QUESTION: {question}"
+                )
+                stream = model.generate_content_stream(composed)
+            else:
+                stream = model.generate_content_stream(question)
 
-        resp_text = getattr(response, "text", None) or "No response"
-        return AskResponse(answer=remove_markdown(resp_text), used_search=bool(use_search))
+            buffer = ""
+            for chunk in stream:
+                text = chunk.text or ""
+                if text:
+                    buffer += text
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        clean = remove_markdown(line).strip()
+                        if clean:
+                            yield f"data: {clean}\n\n"
+            if buffer.strip():
+                yield f"data: {remove_markdown(buffer).strip()}\n\n"
 
-    except Exception as e:
-        print("ERROR in /ask:", str(e))
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+            yield "event: end\ndata: done\n\n"
+
+        except Exception as e:
+            print("ERROR in /ask_stream:", str(e))
+            print(traceback.format_exc())
+            yield f"event: error\ndata: {str(e)}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
