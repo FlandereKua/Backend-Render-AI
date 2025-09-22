@@ -3,6 +3,7 @@ import os
 import re
 import requests
 import traceback
+import urllib.parse
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -164,3 +165,31 @@ async def ask_stream(req: AskRequest):
             yield f"event: error\ndata: {str(e)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+class ImageRequest(BaseModel):
+    prompt: str
+
+@app.post("/ask_image")
+def ask_image(req: ImageRequest):
+    """
+    Generate an AI image from the given prompt using Pollinations API
+    and return it as a PNG stream.
+    """
+    prompt = req.prompt.strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Empty 'prompt' field")
+
+    try:
+        encoded = urllib.parse.quote(prompt)
+        url = f"https://image.pollinations.ai/prompt/{encoded}?nologo=true&width=1024&height=576"
+
+        # Pollinations sometimes takes a few seconds to render the image
+        r = requests.get(url, stream=True, timeout=60)
+        r.raise_for_status()
+
+        return StreamingResponse(r.iter_content(chunk_size=8192), media_type="image/png")
+
+    except Exception as e:
+        print("ERROR in /ask_image:", str(e))
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
