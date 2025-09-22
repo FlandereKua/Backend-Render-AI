@@ -5,7 +5,7 @@ import requests
 import traceback
 import urllib.parse
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -108,6 +108,9 @@ def format_search_context(search_results: dict, news_results: dict | None = None
 class AskRequest(BaseModel):
     question: str
 
+class ImageRequest(BaseModel):
+    prompt: str
+
 # ---------------- Endpoints ----------------
 @app.get("/")
 def root():
@@ -166,9 +169,6 @@ async def ask_stream(req: AskRequest):
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-class ImageRequest(BaseModel):
-    prompt: str
-
 @app.post("/ask_image")
 def ask_image(req: ImageRequest):
     """
@@ -193,3 +193,25 @@ def ask_image(req: ImageRequest):
         print("ERROR in /ask_image:", str(e))
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
+
+@app.post("/analyze_image")
+async def analyze_image(file: UploadFile = File(...)):
+    """
+    Receive an uploaded image, analyze its contents using Gemini multimodal,
+    and return a descriptive analysis.
+    """
+    try:
+        contents = await file.read()
+
+        response = model.generate_content([
+            "Analyze this image in detail. Describe objects, people, text, and overall context.",
+            {"mime_type": file.content_type, "data": contents},
+        ])
+
+        analysis = getattr(response, "text", None) or "No analysis available"
+        return {"analysis": remove_markdown(analysis)}
+
+    except Exception as e:
+        print("ERROR in /analyze_image:", str(e))
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Image analysis failed: {str(e)}")
