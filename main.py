@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import google.generativeai as genai
+import httpx
 
 # ---------------- Load environment ----------------
 load_dotenv()
@@ -75,7 +76,7 @@ def needs_realtime_search(prompt: str) -> bool:
     ]
     return any(re.search(pattern, p) for pattern in current_patterns)
 
-def search_with_serper(query: str, api_key: str, search_type: str = "search"):
+async def search_with_serper(query: str, api_key: str, search_type: str = "search"):
     """Perform a Google Serper API search."""
     url = f"https://google.serper.dev/{search_type}"
     headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
@@ -130,11 +131,13 @@ async def ask_stream(req: AskRequest):
 
     def event_stream():
         try:
+            yield "event: start\ndata: thinking\n\n"
+
             if use_search:
-                web_results = search_with_serper(question, SERPER_API_KEY, "search")
+                web_results = await search_with_serper(question, SERPER_API_KEY, "search")
                 news_results = None
                 if any(k in question.lower() for k in ["news", "latest", "breaking", "today"]):
-                    news_results = search_with_serper(question, SERPER_API_KEY, "news")
+                    news_results = await search_with_serper(question, SERPER_API_KEY, "news")
 
                 search_context = format_search_context(web_results, news_results)
                 composed = (
