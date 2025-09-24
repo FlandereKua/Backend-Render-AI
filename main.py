@@ -131,13 +131,12 @@ async def ask_stream(req: AskRequest):
 
     async def event_stream():
         try:
-            yield "event: start\ndata: thinking\n\n"
-
             if use_search:
-                web_results = await search_with_serper(question, SERPER_API_KEY, "search")
+                # ... (your search logic remains the same)
+                web_results = search_with_serper(question, SERPER_API_KEY, "search")
                 news_results = None
                 if any(k in question.lower() for k in ["news", "latest", "breaking", "today"]):
-                    news_results = await search_with_serper(question, SERPER_API_KEY, "news")
+                    news_results = search_with_serper(question, SERPER_API_KEY, "news")
 
                 search_context = format_search_context(web_results, news_results)
                 composed = (
@@ -146,12 +145,15 @@ async def ask_stream(req: AskRequest):
                     f"{search_context}\n\n"
                     f"USER QUESTION: {question}"
                 )
-                stream = model.generate_content_stream(composed)
+                # --- CORRECTED LINE ---
+                stream = model.generate_content(composed, stream=True)
             else:
-                stream = model.generate_content_stream(question)
+                # --- CORRECTED LINE ---
+                stream = model.generate_content(question, stream=True)
 
             buffer = ""
             for chunk in stream:
+                # ... (the rest of your loop is correct)
                 text = chunk.text or ""
                 if text:
                     buffer += text
