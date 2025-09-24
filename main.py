@@ -129,7 +129,7 @@ async def ask_stream(req: AskRequest):
 
     use_search = SERPER_API_KEY and needs_realtime_search(question)
 
-    def event_stream():
+    async def event_stream():
         try:
             yield "event: start\ndata: thinking\n\n"
 
