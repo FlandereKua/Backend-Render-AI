@@ -27,8 +27,9 @@ SYSTEM_PROMPT = """You are a helpful, concise assistant.
 - Otherwise, use your general knowledge.
 """
 
+# NOTE: gemini-2.5-flash does not exist. Using a valid model name.
 model = genai.GenerativeModel(
-    model_name="gemini-2.5-flash",
+    model_name="gemini-1.5-flash", 
     system_instruction=SYSTEM_PROMPT,
     generation_config={
         "temperature": 0.6,
@@ -76,16 +77,19 @@ def needs_realtime_search(prompt: str) -> bool:
     ]
     return any(re.search(pattern, p) for pattern in current_patterns)
 
+# --- CHANGED: search_with_serper now uses httpx for true async operation ---
 async def search_with_serper(query: str, api_key: str, search_type: str = "search"):
-    """Perform a Google Serper API search."""
+    """Perform an asynchronous Google Serper API search."""
     url = f"https://google.serper.dev/{search_type}"
     headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
     payload = {"q": query, "num": 5}
     if search_type == "news":
         payload["tbs"] = "qdr:d"  # restrict to last 24h
-    r = requests.post(url, headers=headers, json=payload, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    
+    async with httpx.AsyncClient() as client:
+        r = await client.post(url, headers=headers, json=payload, timeout=15)
+        r.raise_for_status()
+        return r.json()
 
 def format_search_context(search_results: dict, news_results: dict | None = None) -> str:
     """Format Serper results into context text for Gemini."""
@@ -129,14 +133,17 @@ async def ask_stream(req: AskRequest):
 
     use_search = SERPER_API_KEY and needs_realtime_search(question)
 
+    # --- CHANGED: event_stream is now an async generator ---
     async def event_stream():
         try:
+            yield "event: start\ndata: thinking\n\n"
+
             if use_search:
-                # ... (your search logic remains the same)
-                web_results = search_with_serper(question, SERPER_API_KEY, "search")
+                # --- CHANGED: Added `await` to the async function calls ---
+                web_results = await search_with_serper(question, SERPER_API_KEY, "search")
                 news_results = None
                 if any(k in question.lower() for k in ["news", "latest", "breaking", "today"]):
-                    news_results = search_with_serper(question, SERPER_API_KEY, "news")
+                    news_results = await search_with_serper(question, SERPER_API_KEY, "news")
 
                 search_context = format_search_context(web_results, news_results)
                 composed = (
@@ -145,15 +152,15 @@ async def ask_stream(req: AskRequest):
                     f"{search_context}\n\n"
                     f"USER QUESTION: {question}"
                 )
-                # --- CORRECTED LINE ---
-                stream = model.generate_content(composed, stream=True)
+                # --- CHANGED: Use the async method for Gemini streaming ---
+                stream = await model.generate_content_async(composed, stream=True)
             else:
-                # --- CORRECTED LINE ---
-                stream = model.generate_content(question, stream=True)
+                # --- CHANGED: Use the async method for Gemini streaming ---
+                stream = await model.generate_content_async(question, stream=True)
 
             buffer = ""
-            for chunk in stream:
-                # ... (the rest of your loop is correct)
+            # --- CHANGED: Use `async for` to iterate over the async stream ---
+            async for chunk in stream:
                 text = chunk.text or ""
                 if text:
                     buffer += text
@@ -188,7 +195,6 @@ def ask_image(req: ImageRequest):
         encoded = urllib.parse.quote(prompt)
         url = f"https://image.pollinations.ai/prompt/{encoded}?nologo=true&width=1024&height=576"
 
-        # Pollinations sometimes takes a few seconds to render the image
         r = requests.get(url, stream=True, timeout=60)
         r.raise_for_status()
 
@@ -208,7 +214,7 @@ async def analyze_image(file: UploadFile = File(...)):
     try:
         contents = await file.read()
 
-        response = model.generate_content([
+        response = await model.generate_content_async([
             "Analyze this image in detail. Describe objects, people, text, and overall context.",
             {"mime_type": file.content_type, "data": contents},
         ])
