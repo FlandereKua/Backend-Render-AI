@@ -4,10 +4,11 @@ import re
 import requests
 import traceback
 import urllib.parse
+import base64
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 import google.generativeai as genai
 import httpx
@@ -27,9 +28,8 @@ SYSTEM_PROMPT = """You are a helpful, concise assistant.
 - Otherwise, use your general knowledge.
 """
 
-# NOTE: gemini-2.5-flash does not exist. Using a valid model name.
 model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash", 
+    model_name="gemini-1.5-flash",
     system_instruction=SYSTEM_PROMPT,
     generation_config={
         "temperature": 0.6,
@@ -77,7 +77,6 @@ def needs_realtime_search(prompt: str) -> bool:
     ]
     return any(re.search(pattern, p) for pattern in current_patterns)
 
-# --- CHANGED: search_with_serper now uses httpx for true async operation ---
 async def search_with_serper(query: str, api_key: str, search_type: str = "search"):
     """Perform an asynchronous Google Serper API search."""
     url = f"https://google.serper.dev/{search_type}"
@@ -85,7 +84,7 @@ async def search_with_serper(query: str, api_key: str, search_type: str = "searc
     payload = {"q": query, "num": 5}
     if search_type == "news":
         payload["tbs"] = "qdr:d"  # restrict to last 24h
-    
+
     async with httpx.AsyncClient() as client:
         r = await client.post(url, headers=headers, json=payload, timeout=15)
         r.raise_for_status()
@@ -116,6 +115,10 @@ class AskRequest(BaseModel):
 class ImageRequest(BaseModel):
     prompt: str
 
+class ImageResponse(BaseModel):
+    image: str  # Base64 encoded image string
+    analysis: str
+
 # ---------------- Endpoints ----------------
 @app.get("/")
 def root():
@@ -133,13 +136,11 @@ async def ask_stream(req: AskRequest):
 
     use_search = SERPER_API_KEY and needs_realtime_search(question)
 
-    # --- CHANGED: event_stream is now an async generator ---
     async def event_stream():
         try:
             yield "event: start\ndata: thinking\n\n"
 
             if use_search:
-                # --- CHANGED: Added `await` to the async function calls ---
                 web_results = await search_with_serper(question, SERPER_API_KEY, "search")
                 news_results = None
                 if any(k in question.lower() for k in ["news", "latest", "breaking", "today"]):
@@ -152,14 +153,11 @@ async def ask_stream(req: AskRequest):
                     f"{search_context}\n\n"
                     f"USER QUESTION: {question}"
                 )
-                # --- CHANGED: Use the async method for Gemini streaming ---
                 stream = await model.generate_content_async(composed, stream=True)
             else:
-                # --- CHANGED: Use the async method for Gemini streaming ---
                 stream = await model.generate_content_async(question, stream=True)
 
             buffer = ""
-            # --- CHANGED: Use `async for` to iterate over the async stream ---
             async for chunk in stream:
                 text = chunk.text or ""
                 if text:
@@ -181,29 +179,49 @@ async def ask_stream(req: AskRequest):
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-@app.post("/ask_image")
-def ask_image(req: ImageRequest):
+# --- MODIFIED: This endpoint now uses a second AI agent for analysis ---
+@app.post("/ask_image", response_model=ImageResponse)
+async def ask_image(req: ImageRequest):
     """
-    Generate an AI image from the given prompt using Pollinations API
-    and return it as a PNG stream.
+    Generates an image, analyzes it, and returns both the image
+    and a follow-up question from an analysis agent.
     """
     prompt = req.prompt.strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Empty 'prompt' field")
 
     try:
-        encoded = urllib.parse.quote(prompt)
-        url = f"https://image.pollinations.ai/prompt/{encoded}?nologo=true&width=1024&height=576"
+        # Step 1: Generate the image using Pollinations API
+        encoded_prompt = urllib.parse.quote(prompt)
+        image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?nologo=true&width=1024&height=576"
 
-        r = requests.get(url, stream=True, timeout=60)
-        r.raise_for_status()
+        async with httpx.AsyncClient() as client:
+            response = await client.get(image_url, timeout=60)
+            response.raise_for_status()
+            image_bytes = await response.aread()
 
-        return StreamingResponse(r.iter_content(chunk_size=8192), media_type="image/png")
+        # Step 2: Have the second AI agent analyze the generated image
+        analysis_prompt = "Briefly describe this image and then ask the user if they would like to add anything to the picture."
+        analysis_response = await model.generate_content_async([
+            analysis_prompt,
+            {"mime_type": "image/png", "data": image_bytes},
+        ])
+
+        analysis_text = getattr(analysis_response, "text", "Could not analyze image.")
+
+        # Step 3: Encode image in Base64 and return JSON response
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+        data_url = f"data:image/png;base64,{base64_image}"
+
+        return JSONResponse(content={
+            "image": data_url,
+            "analysis": remove_markdown(analysis_text)
+        })
 
     except Exception as e:
         print("ERROR in /ask_image:", str(e))
         print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Image generation and analysis failed: {str(e)}")
 
 @app.post("/analyze_image")
 async def analyze_image(file: UploadFile = File(...)):
