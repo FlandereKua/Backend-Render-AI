@@ -1,246 +1,31 @@
-# main.py
-import os
-import re
-import requests
-import traceback
-import urllib.parse
-import base64
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel
-import google.generativeai as genai
-import httpx
+from app.api.chat import router as chat_router
+from app.db.history_manager import init_db
 
-# ---------------- Load environment ----------------
-load_dotenv()
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-SERPER_API_KEY = os.getenv("SERPER_API_KEY")
-if not GOOGLE_API_KEY:
-    raise RuntimeError("GOOGLE_API_KEY must be set in environment variables")
-
-# ---------------- Gemini setup ----------------
-genai.configure(api_key=GOOGLE_API_KEY)
-
-SYSTEM_PROMPT = """You are a helpful, concise assistant.
-- Use provided real-time search context (if present) to answer up-to-date questions, and say when you used it.
-- Otherwise, use your general knowledge.
-"""
-
-model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",
-    system_instruction=SYSTEM_PROMPT,
-    generation_config={
-        "temperature": 0.6,
-        "top_p": 0.9,
-        "max_output_tokens": 4000,
-    },
+app = FastAPI(
+    title="Locaith AI Agent",
+    description="AI Agent powered by Gemini Multi-Model Architecture",
+    version="1.0.0"
 )
 
-# ---------------- FastAPI setup ----------------
-app = FastAPI(title="Gemini FastAPI Webhook")
+# Bật CORS cho toàn bộ domain (nếu muốn giới hạn thì sửa allow_origins)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # 🔒 Replace with your frontend domain in production
+    allow_origins=["*"],        # hoặc ví dụ: ["https://yourdomain.com"]
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],        # cho phép GET, POST, PUT, DELETE, OPTIONS
+    allow_headers=["*"],        # cho phép tất cả headers
 )
 
-# ---------------- Utilities ----------------
-def remove_markdown(text: str) -> str:
-    """Remove markdown formatting for cleaner output."""
-    text = re.sub(r"\*{1,3}([^\*]+)\*{1,3}", r"\1", text)
-    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
-    text = re.sub(r"```[^\n]*\n(.*?)```", r"\1", text, flags=re.DOTALL)
-    text = re.sub(r"`([^`]+)`", r"\1", text)
-    text = re.sub(r"^[\-\*\_]{3,}$", "", text, flags=re.MULTILINE)
-    text = re.sub(r"^>\s+", "", text, flags=re.MULTILINE)
-    text = re.sub(r"^[\*\-\+]\s+", "• ", text, flags=re.MULTILINE)
-    text = re.sub(r"^\d+\.\s+", "• ", text, flags=re.MULTILINE)
-    return text.strip()
+@app.on_event("startup")
+def on_startup():
+    init_db()
 
-def needs_realtime_search(prompt: str) -> bool:
-    """Heuristic to decide if real-time search is needed."""
-    realtime_keywords = [
-        "today","current","latest","recent","now","news","update","price",
-        "weather","score","stock","crypto","bitcoin","election","breaking",
-        "this week","this month","yesterday","tomorrow","forecast","trending","live"
-    ]
-    p = prompt.lower()
-    if any(k in p for k in realtime_keywords):
-        return True
-    current_patterns = [
-        r"what.*happening", r"who.*president", r"who.*prime minister",
-        r"what.*price", r"how much.*cost", r"what.*weather"
-    ]
-    return any(re.search(pattern, p) for pattern in current_patterns)
+# Đăng ký router chính cho chat agent
+app.include_router(chat_router, prefix="/api")
 
-async def search_with_serper(query: str, api_key: str, search_type: str = "search"):
-    """Perform an asynchronous Google Serper API search."""
-    url = f"https://google.serper.dev/{search_type}"
-    headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
-    payload = {"q": query, "num": 5}
-    if search_type == "news":
-        payload["tbs"] = "qdr:d"  # restrict to last 24h
-
-    async with httpx.AsyncClient() as client:
-        r = await client.post(url, headers=headers, json=payload, timeout=15)
-        r.raise_for_status()
-        return r.json()
-
-def format_search_context(search_results: dict, news_results: dict | None = None) -> str:
-    """Format Serper results into context text for Gemini."""
-    context = "REAL-TIME SEARCH RESULTS:\n\n"
-    if search_results and "organic" in search_results:
-        context += "WEB SEARCH RESULTS:\n"
-        for i, result in enumerate(search_results["organic"][:3], 1):
-            context += f"\n{i}. {result.get('title','No title')}\n"
-            context += f"   Source: {result.get('link','No link')}\n"
-            context += f"   Summary: {result.get('snippet','No snippet')}\n"
-    if news_results and "news" in news_results:
-        context += "\n\nLATEST NEWS:\n"
-        for i, article in enumerate(news_results["news"][:3], 1):
-            context += f"\n{i}. {article.get('title','No title')}\n"
-            context += f"   Source: {article.get('source','Unknown')}\n"
-            context += f"   Date: {article.get('date','No date')}\n"
-            context += f"   Summary: {article.get('snippet','No summary')}\n"
-    return context
-
-# ---------------- Models ----------------
-class AskRequest(BaseModel):
-    question: str
-
-class ImageRequest(BaseModel):
-    prompt: str
-
-class ImageResponse(BaseModel):
-    image: str  # Base64 encoded image string
-    analysis: str
-
-# ---------------- Endpoints ----------------
+# Endpoint test nhanh
 @app.get("/")
-def root():
-    return {"status": "ok", "message": "Gemini FastAPI service running."}
-
-@app.post("/ask_stream")
-async def ask_stream(req: AskRequest):
-    """
-    Stream Gemini response line-by-line over SSE.
-    Uses Serper when real-time search is needed.
-    """
-    question = req.question.strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="Empty 'question' field")
-
-    use_search = SERPER_API_KEY and needs_realtime_search(question)
-
-    async def event_stream():
-        try:
-            yield "event: start\ndata: thinking\n\n"
-
-            if use_search:
-                web_results = await search_with_serper(question, SERPER_API_KEY, "search")
-                news_results = None
-                if any(k in question.lower() for k in ["news", "latest", "breaking", "today"]):
-                    news_results = await search_with_serper(question, SERPER_API_KEY, "news")
-
-                search_context = format_search_context(web_results, news_results)
-                composed = (
-                    "Based on the following real-time search results, "
-                    "answer the user's question. Indicate you used current search data.\n\n"
-                    f"{search_context}\n\n"
-                    f"USER QUESTION: {question}"
-                )
-                stream = await model.generate_content_async(composed, stream=True)
-            else:
-                stream = await model.generate_content_async(question, stream=True)
-
-            buffer = ""
-            async for chunk in stream:
-                text = chunk.text or ""
-                if text:
-                    buffer += text
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        clean = remove_markdown(line).strip()
-                        if clean:
-                            yield f"data: {clean}\n\n"
-            if buffer.strip():
-                yield f"data: {remove_markdown(buffer).strip()}\n\n"
-
-            yield "event: end\ndata: done\n\n"
-
-        except Exception as e:
-            print("ERROR in /ask_stream:", str(e))
-            print(traceback.format_exc())
-            yield f"event: error\ndata: {str(e)}\n\n"
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-# --- MODIFIED: This endpoint now uses a second AI agent for analysis ---
-@app.post("/ask_image", response_model=ImageResponse)
-async def ask_image(req: ImageRequest):
-    """
-    Generates an image, analyzes it, and returns both the image
-    and a follow-up question from an analysis agent.
-    """
-    prompt = req.prompt.strip()
-    if not prompt:
-        raise HTTPException(status_code=400, detail="Empty 'prompt' field")
-
-    try:
-        # Step 1: Generate the image using Pollinations API
-        encoded_prompt = urllib.parse.quote(prompt)
-        image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?nologo=true&width=1024&height=576"
-
-        async with httpx.AsyncClient() as client:
-            response = await client.get(image_url, timeout=60)
-            response.raise_for_status()
-            image_bytes = await response.aread()
-
-        # Step 2: Have the second AI agent analyze the generated image
-        analysis_prompt = "Briefly describe this image and then ask the user if they would like to add anything to the picture."
-        analysis_response = await model.generate_content_async([
-            analysis_prompt,
-            {"mime_type": "image/png", "data": image_bytes},
-        ])
-
-        analysis_text = getattr(analysis_response, "text", "Could not analyze image.")
-
-        # Step 3: Encode image in Base64 and return JSON response
-        base64_image = base64.b64encode(image_bytes).decode('utf-8')
-        data_url = f"data:image/png;base64,{base64_image}"
-
-        return JSONResponse(content={
-            "image": data_url,
-            "analysis": remove_markdown(analysis_text)
-        })
-
-    except Exception as e:
-        print("ERROR in /ask_image:", str(e))
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Image generation and analysis failed: {str(e)}")
-
-@app.post("/analyze_image")
-async def analyze_image(file: UploadFile = File(...)):
-    """
-    Receive an uploaded image, analyze its contents using Gemini multimodal,
-    and return a descriptive analysis.
-    """
-    try:
-        contents = await file.read()
-
-        response = await model.generate_content_async([
-            "Analyze this image in detail. Describe objects, people, text, and overall context.",
-            {"mime_type": file.content_type, "data": contents},
-        ])
-
-        analysis = getattr(response, "text", None) or "No analysis available"
-        return {"analysis": remove_markdown(analysis)}
-
-    except Exception as e:
-        print("ERROR in /analyze_image:", str(e))
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Image analysis failed: {str(e)}")
+def read_root():
+    return {"status": "Locaith AI Agent is running."}
