@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+google-generativeai
+pydantic
+python-ngrok
+gunicorn
+requests
+python-multipart
+pypdf
+python-docx
+openpyxl
+python-pptx
+pandas
+Pillow

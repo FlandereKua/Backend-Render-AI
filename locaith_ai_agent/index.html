@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Locaith AI Agent - Test Interface</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #f4f7f9;
+            color: #333;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+        }
+        .container {
+            width: 90%;
+            max-width: 800px;
+            background: white;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 8px 30px rgba(0,0,0,0.1);
+        }
+        h1 {
+            text-align: center;
+            color: #1a253c;
+            margin-bottom: 25px;
+        }
+        #prompt-form textarea {
+            width: 100%;
+            padding: 12px;
+            border-radius: 8px;
+            border: 1px solid #dcdcdc;
+            font-size: 16px;
+            resize: vertical;
+            min-height: 100px;
+            box-sizing: border-box;
+        }
+        #prompt-form button {
+            display: block;
+            width: 100%;
+            padding: 12px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            margin-top: 15px;
+            transition: background-color 0.2s;
+        }
+        #prompt-form button:disabled {
+            background-color: #a0cfff;
+            cursor: not-allowed;
+        }
+        #prompt-form button:hover:not(:disabled) {
+            background-color: #0056b3;
+        }
+        .output-section {
+            margin-top: 30px;
+            border-top: 1px solid #eee;
+            padding-top: 20px;
+        }
+        h2 {
+            color: #444;
+            border-bottom: 2px solid #007bff;
+            padding-bottom: 5px;
+            margin-bottom: 15px;
+        }
+        #thinking-log {
+            background-color: #2d3748;
+            color: #a0aec0;
+            padding: 15px;
+            border-radius: 8px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            font-family: "Courier New", Courier, monospace;
+            font-size: 14px;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        #final-answer {
+            background-color: #f8f9fa;
+            padding: 20px;
+            border: 1px solid #e9ecef;
+            border-radius: 8px;
+            line-height: 1.6;
+        }
+        .placeholder {
+            color: #999;
+        }
+        #file-input-wrapper {
+            margin-top: 10px;
+            padding: 10px;
+            border: 2px dashed #dcdcdc;
+            border-radius: 8px;
+            text-align: center;
+            cursor: pointer;
+        }
+        #file-input-wrapper:hover {
+            border-color: #007bff;
+        }
+        #file-name {
+            margin-top: 5px;
+            font-style: italic;
+            color: #555;
+        }
+        #thinking-log code {
+            background-color: rgba(255, 255, 255, 0.1);
+            color: #a0deff;
+            padding: 2px 5px;
+            border-radius: 4px;
+            font-size: 0.9em;
+        }
+        #final-answer .image-container {
+            margin-top: 15px;
+        }
+        #final-answer img.generated-image {
+            max-width: 100%;
+            border-radius: 8px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+        }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+
+    <div class="container">
+        <h1>🧪 Giao diện Test Locaith AI Agent</h1>
+        <form id="prompt-form">
+            <textarea id="prompt-input" placeholder="Nhập yêu cầu của bạn ở đây..." required></textarea>
+            
+            <div id="file-input-wrapper">
+                <label for="file-input">Nhấn vào đây để chọn file (PDF, DOCX, XLSX, PNG, JPG...)</label>
+                <input type="file" id="file-input" style="display: none;">
+                <div id="file-name"></div>
+            </div>
+
+            <button type="submit" id="submit-button">Gửi yêu cầu</button>
+        </form>
+
+        <div class="output-section">
+            <h2>⚙️ Luồng suy nghĩ (Streaming)</h2>
+            <pre id="thinking-log"><span class="placeholder">Chờ nhận dữ liệu...</span></pre>
+        </div>
+
+        <div class="output-section">
+            <h2>✅ Kết quả cuối cùng</h2>
+            <div id="final-answer"><span class="placeholder">Chờ kết quả hoàn chỉnh...</span></div>
+        </div>
+    </div>
+
+    <script>
+        const form = document.getElementById('prompt-form');
+        const input = document.getElementById('prompt-input');
+        const fileInput = document.getElementById('file-input');
+        const fileNameDisplay = document.getElementById('file-name');
+        const submitButton = document.getElementById('submit-button');
+        const thinkingLog = document.getElementById('thinking-log');
+        const finalAnswer = document.getElementById('final-answer');
+
+        document.getElementById('file-input-wrapper').addEventListener('click', () => {
+            fileInput.click();
+        });
+
+        fileInput.addEventListener('change', () => {
+            if (fileInput.files.length > 0) {
+                fileNameDisplay.textContent = `File đã chọn: ${fileInput.files[0].name}`;
+            } else {
+                fileNameDisplay.textContent = '';
+            }
+        });
+
+        function getOrCreateSessionId() {
+            let sessionId = sessionStorage.getItem('chatSessionId');
+            if (!sessionId) {
+                sessionId = `session_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
+                sessionStorage.setItem('chatSessionId', sessionId);
+            }
+            return sessionId;
+        }
+
+        const currentSessionId = getOrCreateSessionId();
+
+        form.addEventListener('submit', async function(event) {
+            event.preventDefault();
+            
+            submitButton.disabled = true;
+            submitButton.textContent = 'Đang xử lý...';
+
+            thinkingLog.innerHTML = '';
+            finalAnswer.innerHTML = '<span class="placeholder">Đang tổng hợp câu trả lời...</span>';
+
+            const prompt = input.value;
+            const file = fileInput.files[0];
+
+            let apiUrl;
+            let bodyData;
+            let headers = {};
+
+            if (file) {
+                apiUrl = 'https://spring-unpastured-doctorially.ngrok-free.dev/api/chat-with-file';
+                bodyData = new FormData();
+                bodyData.append('prompt', prompt);
+                bodyData.append('session_id', currentSessionId);
+                bodyData.append('file', file);
+            } else {
+                apiUrl = 'https://spring-unpastured-doctorially.ngrok-free.dev/api/chat-agent';
+                headers['Content-Type'] = 'application/json';
+                bodyData = JSON.stringify({ 
+                    prompt: prompt,
+                    session_id: currentSessionId
+                });
+            }
+
+            try {
+                const response = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: headers,
+                    body: bodyData,
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Lỗi mạng: ${response.statusText}`);
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) {
+                        break;
+                    }
+                    
+                    buffer += decoder.decode(value, { stream: true });
+                    
+                    const messages = buffer.split('\n\n');
+                    buffer = messages.pop();
+
+                    for (const message of messages) {
+                        if (message.startsWith('data: ')) {
+                            const jsonData = message.substring(6);
+                            try {
+                                const data = JSON.parse(jsonData);
+                                
+                                if (data.type === 'thinking_chunk') {
+                                    thinkingLog.innerHTML += data.content;
+                                    thinkingLog.scrollTop = thinkingLog.scrollHeight;
+                                } else if (data.type === 'thinking_done') {
+                                    thinkingLog.innerHTML += '\n\n--- Quá trình suy nghĩ hoàn tất ---';
+                                } else if (data.type === 'status_update') {
+                                    thinkingLog.innerHTML += `\n\n[Hệ thống: ${data.content}]\n\n`;
+                                    thinkingLog.scrollTop = thinkingLog.scrollHeight;
+                                } else if (data.type === 'generated_image') {
+                                    finalAnswer.innerHTML = '';
+                                    
+                                    const messageP = document.createElement('p');
+                                    messageP.innerHTML = marked.parse(data.final_message);
+                                    finalAnswer.appendChild(messageP);
+
+                                    const imgContainer = document.createElement('div');
+                                    imgContainer.className = 'image-container';
+
+                                    const img = document.createElement('img');
+                                    img.src = `data:image/png;base64,${data.base64_data}`;
+                                    img.alt = data.alt_text;
+                                    img.className = 'generated-image';
+                                    
+                                    imgContainer.appendChild(img);
+                                    finalAnswer.appendChild(imgContainer);
+                                } else if (data.type === 'final_answer') {
+                                    finalAnswer.innerHTML = marked.parse(data.content);
+                                } else if (data.type === 'error') {
+                                    finalAnswer.innerHTML = `<p style="color: red;">Lỗi: ${data.content}</p>`;
+                                }
+                            } catch (e) {
+                                console.error('Lỗi khi parse JSON:', jsonData);
+                            }
+                        }
+                    }
+                }
+
+            } catch (error) {
+                console.error('Đã xảy ra lỗi khi gọi API:', error);
+                finalAnswer.innerHTML = `<p style="color: red;">Không thể kết nối tới server. Vui lòng kiểm tra lại URL và chắc chắn server đang chạy.</p>`;
+            } finally {
+                submitButton.disabled = false;
+                submitButton.textContent = 'Gửi yêu cầu';
+                input.value = '';
+                fileInput.value = '';
+                fileNameDisplay.textContent = '';
+            }
+        });
+    </script>
+
+</body>
+</html>
